@@ -73,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Export format (default: {settings.EXPORT_FORMAT}).",
     )
     p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the resolved execution plan and exit without fetching or writing anything.",
+    )
+    p.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -90,36 +95,101 @@ def resolve_filters(args: argparse.Namespace) -> dict[str, dict]:
     """
     Return a dict of {filter_id: config} to process.
 
-    CLI --filters override the defaults; unrecognised IDs get a
-    sensible fallback config.
+    CLI --filters override the defaults.  Unrecognised IDs receive a
+    minimal fallback: no issue-type filter (keep whatever the Jira JQL
+    returns) and the same chart set as the first configured filter.
     """
+    # Default chart list comes from the first entry in DEFAULT_FILTERS so it
+    # stays in sync with settings; only fall back to an empty list if there
+    # are no configured filters at all.
+    _first_cfg   = next(iter(settings.DEFAULT_FILTERS.values()), {})
+    _default_charts = _first_cfg.get("charts", [])
+
     if args.filters:
         result = {}
         for fid in args.filters:
             if fid in settings.DEFAULT_FILTERS:
                 result[fid] = settings.DEFAULT_FILTERS[fid]
             else:
+                # Unknown filter: trust the JQL (no extra issue-type filter)
                 result[fid] = {
                     "title": f"Filter {fid}",
-                    "issue_types": ["Change Request", "Problem Report"],
-                    "charts": list(
-                        settings.DEFAULT_FILTERS.get(
-                            next(iter(settings.DEFAULT_FILTERS), ""),
-                            {},
-                        ).get(
-                            "charts",
-                            [
-                                "time_deviation",
-                                "missing_due_dates",
-                                "status_distribution",
-                                "aging",
-                            ],
-                        )
-                    ),
+                    "issue_types": [],          # keep all types the JQL returns
+                    "charts": list(_default_charts),
                 }
         return result
 
     return dict(settings.DEFAULT_FILTERS)
+
+
+def _resolve_local_path(fid: str, fcfg: dict) -> Path | None:
+    """
+    Find the local data file for a filter, checking (in order):
+      1. 'local_file' key inside the filter config
+      2. settings.LOCAL_FILES dict (legacy)
+      3. Auto-discovery: data/filter_<id>.xlsx then .csv
+    """
+    # 1. Per-filter config key
+    if "local_file" in fcfg:
+        return Path(fcfg["local_file"])
+
+    # 2. Legacy standalone LOCAL_FILES dict
+    legacy = getattr(settings, "LOCAL_FILES", {})
+    if fid in legacy:
+        return legacy[fid]
+
+    # 3. Auto-discover
+    for ext in ("xlsx", "csv"):
+        candidate = settings.DATA_DIR / f"filter_{fid}.{ext}"
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def dry_run(args: argparse.Namespace) -> None:
+    """Print the execution plan without touching Jira or the filesystem."""
+    filters = resolve_filters(args)
+    fmt     = args.format or settings.EXPORT_FORMAT
+    use_local = args.local or args.report_only
+
+    print("\n=== DRY RUN – execution plan ===\n")
+    print(f"  Mode       : {'local files' if use_local else 'Jira API'}")
+    print(f"  Export fmt : {fmt}")
+    print(f"  Filters    : {len(filters)}\n")
+
+    for i, (fid, fcfg) in enumerate(filters.items(), 1):
+        title       = fcfg.get("title", f"Filter {fid}")
+        issue_types = fcfg.get("issue_types") or ["<all>"]
+        charts      = fcfg.get("charts", [])
+        print(f"  [{i}] Filter ID : {fid}")
+        print(f"       Title     : {title}")
+        print(f"       Types     : {', '.join(issue_types)}")
+        print(f"       Charts    : {', '.join(charts)}")
+
+        if use_local:
+            local_path = _resolve_local_path(fid, fcfg)
+            print(f"       Source    : {local_path or '** NOT FOUND **'}")
+        else:
+            api = f"{settings.JIRA_URL.rstrip('/')}{settings.JIRA_API_PATH}"
+            print(f"       Jira call : GET {api}/filter/{fid}  →  search")
+
+        data_out   = settings.DATA_DIR   / f"filter_{fid}.{fmt}"
+        report_out = settings.REPORTS_DIR / f"report_{fid}.pdf"
+        print(f"       → Data     : {data_out}")
+        print(f"       → Report   : {report_out}")
+        print()
+
+    # Warn about missing env vars for live mode
+    if not use_local:
+        missing = [v for v in ("JIRA_URL", "JIRA_TOKEN") if not getattr(settings, v, "")]
+        if missing:
+            print(f"  ⚠  Missing env vars: {', '.join(missing)}")
+            print("     Set them before running without --local.\n")
+        else:
+            print("  ✓  JIRA_URL and JIRA_TOKEN are configured.\n")
+
+    print("=== end of plan ===\n")
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
@@ -143,9 +213,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     for fid, fcfg in filters.items():
-        title = fcfg.get("title", f"Filter {fid}")
-        issue_types = fcfg.get("issue_types")
-        chart_keys = fcfg.get("charts")
+        title       = fcfg.get("title", f"Filter {fid}")
+        issue_types = fcfg.get("issue_types") or None   # None = keep all types
+        chart_keys  = fcfg.get("charts")
 
         logger.info("=" * 60)
         logger.info("Processing filter %s  –  %s", fid, title)
@@ -153,18 +223,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
         # ---- Ingestion --------------------------------------------------
         if use_local:
-            local_path = settings.LOCAL_FILES.get(fid)
-            if local_path is None:
-                # Attempt to find an auto-exported file
-                for ext in ("xlsx", "csv"):
-                    candidate = settings.DATA_DIR / f"filter_{fid}.{ext}"
-                    if candidate.exists():
-                        local_path = candidate
-                        break
+            local_path = _resolve_local_path(fid, fcfg)
             if local_path is None:
                 logger.error(
-                    "No local file configured or found for filter %s – skipping.",
-                    fid,
+                    "No local file configured or found for filter %s – skipping.", fid
                 )
                 continue
             try:
@@ -221,7 +283,10 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    run_pipeline(args)
+    if args.dry_run:
+        dry_run(args)
+    else:
+        run_pipeline(args)
 
 
 if __name__ == "__main__":
