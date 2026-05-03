@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# UV
+.python-version
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project outputs (keep structure, ignore generated files)
+data/*.csv
+data/*.xlsx
+data/*.xls
+reports/*.pdf
+
+# Environment / secrets
+.env
+*.pem
+*.crt
+*.key
