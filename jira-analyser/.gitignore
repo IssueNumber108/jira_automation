@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# uv
+uv.lock
+
+# Environment
+.env
+
+# Certs (keep example, ignore real ones)
+certs/*.pem
+!certs/.gitkeep
+
+# Outputs
+outputs/
+*.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Test artefacts
+.coverage
+htmlcov/
+.pytest_cache/

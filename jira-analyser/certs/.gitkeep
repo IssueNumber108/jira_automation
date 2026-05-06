@@ -1,0 +1,2 @@
+# This directory holds generated certificates.
+# Real .pem files are gitignored — this file keeps the directory tracked.
